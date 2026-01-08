@@ -1,0 +1,848 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Short Circuit Showdown</title>
+  <style>
+    html, body { margin:0; padding:0; background:#0a0a0a; color:#fff; font-family: Arial, system-ui, sans-serif; }
+    .wrap { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; }
+    canvas { border:2px solid #36ff36; image-rendering: pixelated; background:#000; }
+    .hint { font-size:14px; opacity:.9; text-align:center; padding:0 12px; max-width: 980px; line-height:1.4; }
+    .hint b{ color:#36ff36; font-weight:700;}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div class="hint">
+    <b>ENTER</b>: Start/Confirm · <b>I</b>: Instructions · <b>←/→</b>: Move · <b>SPACE</b>: Jump ·
+    <b>A</b>: Chop Form · <b>S</b>: Knee Form · <b>D</b>: Kick Form · (Non-contact “training showdown”)
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+
+  // ---------- Utilities ----------
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp = (a,b,t)=>a+(b-a)*t;
+  const rand = (a,b)=>a + Math.random()*(b-a);
+  const pick = (arr)=>arr[(Math.random()*arr.length)|0];
+
+  function drawText(x,y,text,size=18,color="#fff",align="left"){
+    ctx.fillStyle = color;
+    ctx.font = `${size}px Arial`;
+    ctx.textAlign = align;
+    ctx.fillText(text, x, y);
+    ctx.textAlign = "left";
+  }
+
+  // ---------- Game State ----------
+  const STATE = { TITLE:"title", INSTR:"instr", ROUND:"round", PLAY:"play", WIN:"win", LOSE:"lose" };
+  let state = STATE.TITLE;
+
+  const keys = new Set();
+  addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    keys.add(k);
+
+    // prevent scroll
+    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k) || e.key===" ") e.preventDefault();
+
+    if (state === STATE.TITLE) {
+      if (e.key === "Enter") startRound();
+      if (k === "i") state = STATE.INSTR;
+    } else if (state === STATE.INSTR) {
+      if (e.key === "Enter") state = STATE.TITLE;
+    } else if (state === STATE.ROUND) {
+      if (e.key === "Enter") state = STATE.PLAY;
+    } else if (state === STATE.WIN || state === STATE.LOSE) {
+      if (e.key === "Enter") resetAll();
+    }
+  }, {passive:false});
+  addEventListener("keyup", (e)=> keys.delete(e.key.toLowerCase()));
+
+  // ---------- Level data ----------
+  const LEVELS = [
+    { name:"Level 1: Hallway Hijinks",   scene:"hallway",  enemy:"robot", hp:90,  speed:1.7, dmg:6,  line:"Robots disguised as students? Deuce enters the hallway." },
+    { name:"Level 2: Cafeteria Circuit", scene:"cafeteria",enemy:"robot", hp:105, speed:2.1, dmg:7,  line:"Cafeteria showdown—watch the trays." },
+    { name:"Level 3: Gym Gauntlet",      scene:"gym",      enemy:"robot", hp:120, speed:2.5, dmg:8,  line:"Gym floor squeaks. Robot joints squeak louder." },
+    { name:"Final: Classroom Override",  scene:"classroom",enemy:"boss",  hp:170, speed:1.6, dmg:11, line:"Class is in session… for an advanced unit." },
+  ];
+  let levelIndex = 0;
+
+  // ---------- World constants ----------
+  const GROUND = 430;
+  const GRAV = 0.62;
+  const HITSTOP_MS = 70;
+  let hitstopTimer = 0;
+  let shake = 0;
+
+  // ---------- Player & Enemy ----------
+  const deuce = {
+    x: 150, y: GROUND, vx:0, vy:0, facing: 1,
+    hp: 120, maxHp: 120,
+    onGround: true,
+    anim: "idle", // idle, walk, jump, chop, knee, kick, recover
+    animT: 0,
+    atkCd: 0,
+    atkWind: 0, // active frames timer
+    atkType: null
+  };
+
+  const enemy = {
+    x: 740, y: GROUND, facing: -1,
+    hp: 100, maxHp: 100,
+    cd: 0,
+    stun: 0,
+    kind: "robot", // robot | boss
+    animT: 0
+  };
+
+  function setAnim(obj, name){
+    if (obj.anim === name) return;
+    obj.anim = name;
+    obj.animT = 0;
+  }
+
+  function rectOverlap(a,b){
+    return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+  }
+
+  function startRound(){
+    const L = LEVELS[levelIndex];
+    enemy.kind = L.enemy;
+    enemy.maxHp = L.hp;
+    enemy.hp = L.hp;
+    enemy.x = 740;
+    enemy.facing = -1;
+    enemy.cd = 0;
+    enemy.stun = 0;
+    enemy.animT = 0;
+
+    deuce.x = 150;
+    deuce.y = GROUND;
+    deuce.vx = 0;
+    deuce.vy = 0;
+    deuce.facing = 1;
+    deuce.onGround = true;
+    setAnim(deuce, "idle");
+    deuce.atkCd = 0;
+    deuce.atkWind = 0;
+    deuce.atkType = null;
+
+    state = STATE.ROUND;
+  }
+
+  function resetAll(){
+    state = STATE.TITLE;
+    levelIndex = 0;
+    deuce.hp = deuce.maxHp;
+  }
+
+  function doHitstop(ms){
+    hitstopTimer = Math.max(hitstopTimer, ms);
+    shake = Math.max(shake, 10);
+  }
+
+  function getAttackHitbox(){
+    if (deuce.atkWind <= 0 || !deuce.atkType) return null;
+
+    // "forms" still need hitboxes for gameplay feel
+    const baseY = deuce.y - 92;
+    const range = deuce.atkType === "a" ? 52 : deuce.atkType === "s" ? 60 : 72;
+    const height = deuce.atkType === "s" ? 54 : 42;
+    const x = deuce.facing === 1 ? deuce.x + 48 : deuce.x - range;
+    const y = baseY + (deuce.atkType === "s" ? 28 : 34);
+    return { x, y, w: range, h: height };
+  }
+
+  function attack(type){
+    if (deuce.atkCd > 0) return;
+    deuce.atkType = type;
+    deuce.atkCd = type==="d" ? 22 : type==="s" ? 18 : 16;
+    deuce.atkWind = type==="d" ? 10 : type==="s" ? 9 : 8; // active window
+    if (type==="a") setAnim(deuce,"chop");
+    if (type==="s") setAnim(deuce,"knee");
+    if (type==="d") setAnim(deuce,"kick");
+  }
+
+  // ---------- Drawing: Articulated Pixel Fighters ----------
+  // We draw at a larger "pixel" size to look sprite-like without being boxy.
+  const P = 4; // pixel size
+
+  function px(x,y,w,h,color){
+    ctx.fillStyle = color;
+    ctx.fillRect((x|0),(y|0),(w|0),(h|0));
+  }
+  function line(x1,y1,x2,y2,color,th=2){
+    ctx.strokeStyle = color;
+    ctx.lineWidth = th;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  }
+
+  // Deuce appearance requested:
+  // - brown swoopy short hair
+  // - glasses
+  // - black hoodie with white letters "Lions"
+  // - tan pants and sneakers
+  function drawDeuce(x, groundY, facing, anim, t){
+    // body anchor (feet)
+    const w = 60, h = 120;
+    const topY = groundY - h;
+
+    // animation phases
+    const walk = Math.sin(t*10);
+    const bob  = anim==="idle" ? Math.sin(t*4)*1.5 : anim==="walk" ? Math.abs(walk)*2.0 : 0;
+    const jumpLift = anim==="jump" ? -6 : 0;
+
+    // limb angles for articulation
+    const armSwing = (anim==="walk") ? walk*0.9 : 0;
+    const legSwing = (anim==="walk") ? walk*1.1 : 0;
+
+    // attack poses (forms)
+    const chop = (anim==="chop") ? Math.sin(clamp(t*12,0,Math.PI))*1.0 : 0;
+    const knee = (anim==="knee") ? Math.sin(clamp(t*12,0,Math.PI))*1.0 : 0;
+    const kick = (anim==="kick") ? Math.sin(clamp(t*12,0,Math.PI))*1.0 : 0;
+
+    const baseX = x;
+    const baseY = topY + bob + jumpLift;
+
+    // palette
+    const skin = "#d3a07f";
+    const hair = "#3b2a1f"; // brown
+    const hood = "#121214";
+    const hood2= "#1b1b1e";
+    const pants= "#c8a36b"; // tan
+    const shoe = "#232325";
+    const white= "#f2f2f2";
+    const glass= "#cfd8e6";
+    const outline = "#0a0a0a";
+
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.beginPath();
+    ctx.ellipse(baseX+28, groundY+8, 18, 6, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // torso (hoodie)
+    px(baseX+14, baseY+40, 30, 30, hood);
+    px(baseX+12, baseY+38, 34, 6, hood2); // hood rim
+
+    // hoodie pocket
+    px(baseX+20, baseY+58, 18, 10, "#0f0f10");
+
+    // text "Lions" (blocky, readable)
+    px(baseX+18, baseY+48, 22, 3, white);
+    px(baseX+18, baseY+52, 22, 3, white);
+    // little "i dot" impression
+    px(baseX+28, baseY+46, 2, 2, white);
+
+    // head
+    px(baseX+18, baseY+16, 22, 22, skin);
+
+    // swoopy hair: heavier fringe on one side
+    px(baseX+18, baseY+16, 22, 6, hair);
+    px(baseX+28, baseY+14, 14, 8, hair);
+    px(baseX+34, baseY+20, 10, 4, hair);
+    px(baseX+18, baseY+16, 4, 12, hair);
+
+    // glasses (medium)
+    px(baseX+18, baseY+26, 22, 4, glass);
+    px(baseX+18, baseY+26, 4, 10, glass);
+    px(baseX+36, baseY+26, 4, 10, glass);
+    px(baseX+28, baseY+28, 4, 2, glass);
+
+    // neck
+    px(baseX+26, baseY+38, 6, 4, skin);
+
+    // arms (articulated)
+    // shoulders
+    const shoulderY = baseY+44;
+    const leftShoulderX  = baseX+14;
+    const rightShoulderX = baseX+44;
+
+    // compute wrist positions
+    let lWristX = leftShoulderX + (anim==="walk" ? -6 : -4);
+    let lWristY = shoulderY + 22 + armSwing*6;
+
+    let rWristX = rightShoulderX + (anim==="walk" ? 10 : 6);
+    let rWristY = shoulderY + 22 - armSwing*6;
+
+    // attack overrides
+    if (anim==="chop"){
+      const dir = facing;
+      rWristX = rightShoulderX + dir*(18 + chop*10);
+      rWristY = shoulderY + 8 - chop*8;
+    }
+    if (anim==="knee"){
+      rWristX = rightShoulderX + facing*(10 + knee*6);
+      rWristY = shoulderY + 10;
+      lWristX = leftShoulderX - facing*(6 + knee*4);
+      lWristY = shoulderY + 14;
+    }
+    if (anim==="kick"){
+      rWristX = rightShoulderX + facing*(8 + kick*4);
+      rWristY = shoulderY + 10;
+    }
+
+    // draw upper arms as thick lines + forearms
+    function arm(sx,sy,wx,wy){
+      line(sx,sy, wx,wy, hood, 6);
+      // hands
+      px(wx-2, wy-2, 6, 6, skin);
+      // outline
+      line(sx,sy, wx,wy, outline, 1);
+    }
+    arm(leftShoulderX, shoulderY, lWristX, lWristY);
+    arm(rightShoulderX, shoulderY, rWristX, rWristY);
+
+    // legs (tan pants) articulated
+    const hipY = baseY+70;
+    const leftHipX = baseX+24;
+    const rightHipX= baseX+34;
+
+    let lFootX = leftHipX  + (anim==="walk" ? legSwing*8 : 0);
+    let rFootX = rightHipX + (anim==="walk" ? -legSwing*8 : 0);
+    let lFootY = groundY + (anim==="walk" ? Math.abs(legSwing)*2 : 0);
+    let rFootY = groundY + (anim==="walk" ? Math.abs(legSwing)*2 : 0);
+
+    if (anim==="knee"){
+      // lift one knee
+      lFootX = leftHipX + facing*8;
+      lFootY = groundY - 24*knee;
+    }
+    if (anim==="kick"){
+      // extend one leg
+      rFootX = rightHipX + facing*(28 + kick*18);
+      rFootY = groundY - 10*kick;
+    }
+
+    function leg(hx,hy,fx,fy){
+      line(hx,hy, fx,fy, pants, 7);
+      line(hx,hy, fx,fy, outline, 1);
+      // shoes
+      px(fx-6, fy-2, 16, 8, shoe);
+      px(fx-2, fy+2, 10, 3, "#111");
+    }
+    leg(leftHipX, hipY, lFootX, lFootY);
+    leg(rightHipX, hipY, rFootX, rFootY);
+
+    // small outline around body core
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(baseX+14, baseY+40, 30, 30);
+
+    // facing flip illusion: add a small nose highlight on facing side
+    const noseX = facing===1 ? baseX+39 : baseX+18;
+    px(noseX, baseY+30, 2, 2, "#b9896d");
+  }
+
+  function drawRobot(x, groundY, facing, kind, t, stunned=false){
+    // Robot is cartoonish but articulated: head, torso, arms, legs, joints.
+    const isBoss = (kind==="boss");
+    const scale = isBoss ? 1.25 : 1.0;
+    const w = 70*scale, h = 130*scale;
+    const topY = groundY - h;
+
+    const baseX = x;
+    const baseY = topY;
+
+    // anim
+    const sway = Math.sin(t*4) * (isBoss ? 2.2 : 1.6);
+    const walk = Math.sin(t*9);
+    const step = Math.abs(walk);
+
+    // palette
+    const metal1 = "#6b7480";
+    const metal2 = "#3e4650";
+    const joint  = "#1f252b";
+    const glow   = stunned ? "#ffce3a" : "#39e7ff";
+    const outline= "#0a0a0a";
+
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.beginPath();
+    ctx.ellipse(baseX+30*scale, groundY+8, 20*scale, 7*scale, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // torso
+    px(baseX+18*scale, baseY+46*scale + sway, 34*scale, 34*scale, metal1);
+    px(baseX+22*scale, baseY+50*scale + sway, 26*scale, 26*scale, metal2);
+
+    // head
+    px(baseX+22*scale, baseY+18*scale + sway, 26*scale, 24*scale, metal1);
+
+    // eyes
+    px(baseX+28*scale, baseY+28*scale + sway, 6*scale, 4*scale, glow);
+    px(baseX+38*scale, baseY+28*scale + sway, 6*scale, 4*scale, glow);
+
+    // mouth grill
+    px(baseX+28*scale, baseY+36*scale + sway, 16*scale, 3*scale, joint);
+
+    // arms joints
+    const shoulderY = baseY+56*scale + sway;
+    const lShoulderX = baseX+18*scale;
+    const rShoulderX = baseX+52*scale;
+
+    // arm swing
+    const aSwing = (kind==="boss") ? walk*0.5 : walk*0.9;
+    const lWristX = lShoulderX - 10*scale + aSwing*6*scale;
+    const rWristX = rShoulderX + 10*scale - aSwing*6*scale;
+    const wristY  = shoulderY + 28*scale;
+
+    function robotArm(sx,sy,wx,wy){
+      // upper arm bar
+      line(sx,sy, wx,wy, metal2, 7*scale);
+      // joint discs
+      ctx.fillStyle = joint;
+      ctx.beginPath(); ctx.arc(sx,sy, 5*scale, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(wx,wy, 5*scale, 0, Math.PI*2); ctx.fill();
+      // hand clamp
+      px(wx-6*scale, wy-2*scale, 12*scale, 6*scale, metal1);
+      px(wx-4*scale, wy+2*scale, 8*scale, 2*scale, joint);
+      // outline
+      line(sx,sy, wx,wy, outline, 1);
+    }
+    robotArm(lShoulderX, shoulderY, lWristX, wristY);
+    robotArm(rShoulderX, shoulderY, rWristX, wristY);
+
+    // legs
+    const hipY = baseY+86*scale + sway;
+    const lHipX = baseX+30*scale;
+    const rHipX = baseX+40*scale;
+
+    const lFootX = lHipX + walk*10*scale;
+    const rFootX = rHipX - walk*10*scale;
+    const lFootY = groundY + step*2*scale;
+    const rFootY = groundY + step*2*scale;
+
+    function robotLeg(hx,hy,fx,fy){
+      line(hx,hy, fx,fy, metal2, 8*scale);
+      ctx.fillStyle = joint;
+      ctx.beginPath(); ctx.arc(hx,hy, 5*scale, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(fx,fy, 5*scale, 0, Math.PI*2); ctx.fill();
+      // foot plate
+      px(fx-10*scale, fy-2*scale, 22*scale, 8*scale, metal1);
+      px(fx-8*scale, fy+2*scale, 18*scale, 2*scale, joint);
+      line(hx,hy, fx,fy, outline, 1);
+    }
+    robotLeg(lHipX, hipY, lFootX, lFootY);
+    robotLeg(rHipX, hipY, rFootX, rFootY);
+
+    // boss extras: chest core + shoulder pads
+    if (isBoss){
+      // shoulder pads
+      px(baseX+10*scale, baseY+44*scale + sway, 16*scale, 12*scale, metal1);
+      px(baseX+54*scale, baseY+44*scale + sway, 16*scale, 12*scale, metal1);
+      // chest core glow
+      px(baseX+33*scale, baseY+60*scale + sway, 8*scale, 8*scale, stunned ? "#ff7a3a" : "#ffd23a");
+      // little cables
+      line(baseX+36*scale, baseY+68*scale + sway, baseX+26*scale, baseY+78*scale + sway, joint, 2);
+      line(baseX+36*scale, baseY+68*scale + sway, baseX+46*scale, baseY+78*scale + sway, joint, 2);
+    }
+
+    // outline torso/head for clarity
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(baseX+18*scale, baseY+46*scale + sway, 34*scale, 34*scale);
+    ctx.strokeRect(baseX+22*scale, baseY+18*scale + sway, 26*scale, 24*scale);
+  }
+
+  // ---------- Backgrounds (distinct school settings) ----------
+  function drawHallway(t){
+    // walls/floor
+    ctx.fillStyle="#101418"; ctx.fillRect(0,0,canvas.width,canvas.height);
+    // floor
+    ctx.fillStyle="#0c0f12"; ctx.fillRect(0,320,canvas.width,220);
+    // perspective floor tiles
+    for(let i=0;i<16;i++){
+      ctx.strokeStyle="rgba(255,255,255,0.05)";
+      ctx.beginPath();
+      ctx.moveTo(0, 320 + i*14);
+      ctx.lineTo(canvas.width, 320 + i*14);
+      ctx.stroke();
+    }
+    // ceiling lights
+    for(let i=0;i<7;i++){
+      ctx.fillStyle="rgba(255,255,255,0.06)";
+      ctx.fillRect(140+i*120, 30, 90, 16);
+    }
+    // lockers left/right
+    ctx.fillStyle="#1a222a";
+    ctx.fillRect(0,90,240,260);
+    ctx.fillRect(720,90,240,260);
+    ctx.fillStyle="#0f151b";
+    for(let i=0;i<9;i++){
+      ctx.fillRect(20+i*24,110,16,230);
+      ctx.fillRect(740+i*24,110,16,230);
+    }
+    // middle banner + exit sign
+    ctx.strokeStyle="rgba(255,255,255,0.08)";
+    ctx.beginPath(); ctx.moveTo(260,130); ctx.lineTo(480,95); ctx.lineTo(700,130); ctx.stroke();
+    ctx.fillStyle="#2fff2f";
+    ctx.fillRect(460,92,44,16);
+    drawText(472,104,"EXIT",11,"#001800");
+    // water fountain hint
+    ctx.fillStyle="#12181e"; ctx.fillRect(440,250,80,55);
+    ctx.fillStyle="#1e2a33"; ctx.fillRect(450,260,60,35);
+    // grain
+    grain(0.04);
+  }
+
+  function drawCafeteria(t){
+    ctx.fillStyle="#0f1316"; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle="#0b0e11"; ctx.fillRect(0,330,canvas.width,210);
+
+    // serving line
+    ctx.fillStyle="#151a1f"; ctx.fillRect(0,120,960,85);
+    ctx.fillStyle="#1b222a"; ctx.fillRect(0,120,960,10);
+
+    // menu board
+    ctx.fillStyle="#0b0d10"; ctx.fillRect(650,38,285,80);
+    drawText(665,62,"TODAY:",14,"#eaeaea");
+    drawText(665,84,"• PIZZA (PROBABLY NORMAL)",12,"#cfd3d6");
+    drawText(665,104,"• MILK (NON-ROBOT CLAIMED)",12,"#cfd3d6");
+
+    // tables
+    for(let i=0;i<4;i++){
+      const x = 120+i*190;
+      const y = 300 + (i%2)*18;
+      ctx.fillStyle="#151b22"; ctx.fillRect(x,y,140,20);
+      ctx.fillStyle="#11161c"; ctx.fillRect(x+12,y-40,14,40);
+      ctx.fillRect(x+114,y-40,14,40);
+      // benches
+      ctx.fillStyle="#0f1318"; ctx.fillRect(x-10,y+26,160,10);
+    }
+
+    // ceiling lights
+    for(let i=0;i<6;i++){
+      ctx.fillStyle="rgba(255,255,255,0.05)";
+      ctx.fillRect(170+i*130, 34, 100, 14);
+    }
+    grain(0.04);
+  }
+
+  function drawGym(t){
+    ctx.fillStyle="#0e1114"; ctx.fillRect(0,0,canvas.width,canvas.height);
+    // floor wood
+    ctx.fillStyle="#1a1410"; ctx.fillRect(0,320,960,220);
+    for(let i=0;i<40;i++){
+      ctx.strokeStyle="rgba(255,255,255,0.03)";
+      ctx.beginPath(); ctx.moveTo(i*24,320); ctx.lineTo(i*24,540); ctx.stroke();
+    }
+    // court lines
+    ctx.strokeStyle="rgba(255,255,255,0.10)";
+    ctx.lineWidth=2;
+    ctx.strokeRect(300,340,360,160);
+    ctx.beginPath(); ctx.arc(480,420,60,0,Math.PI*2); ctx.stroke();
+    ctx.lineWidth=1;
+
+    // bleachers
+    ctx.fillStyle="#10161b";
+    for(let i=0;i<7;i++){
+      ctx.fillRect(40,140+i*24,260,18);
+    }
+
+    // hoop
+    ctx.fillStyle="#0a0d10"; ctx.fillRect(440,115,80,8);
+    ctx.fillStyle="#0a0d10"; ctx.fillRect(476,123,8,80);
+    ctx.strokeStyle="rgba(255,255,255,0.14)";
+    ctx.strokeRect(450,150,60,36);
+
+    // scoreboard
+    ctx.fillStyle="#0b0d10"; ctx.fillRect(820,70,110,70);
+    drawText(835,98,"ROBOT",14,"#36ff36");
+    drawText(850,124,String(3-levelIndex),18,"#eaeaea");
+    grain(0.04);
+  }
+
+  function drawClassroom(t){
+    ctx.fillStyle="#101317"; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle="#0b0e11"; ctx.fillRect(0,320,960,220);
+
+    // whiteboard
+    ctx.fillStyle="#1a2026"; ctx.fillRect(70,70,520,120);
+    ctx.fillStyle="#e8e8e8"; ctx.fillRect(82,82,496,96);
+    ctx.fillStyle="#cfd3d6";
+    drawText(100,115,"POP QUIZ:",18,"#222");
+    drawText(100,142,"1) Identify the robot student.",14,"#222");
+    drawText(100,165,"2) Politely request it to power down.",14,"#222");
+
+    // teacher desk
+    ctx.fillStyle="#141a20"; ctx.fillRect(650,235,220,90);
+    ctx.fillStyle="#0f141a"; ctx.fillRect(670,255,180,50);
+    // chalkboard side
+    ctx.fillStyle="#0f141a"; ctx.fillRect(620,70,300,120);
+    ctx.fillStyle="#2fff2f"; ctx.fillRect(630,90,120,6);
+    // student desks
+    for(let r=0;r<2;r++){
+      for(let i=0;i<4;i++){
+        const x = 140+i*180;
+        const y = 330+r*80;
+        ctx.fillStyle="#151b22"; ctx.fillRect(x,y,120,18);
+        ctx.fillStyle="#0f1318"; ctx.fillRect(x+10,y-26,10,26);
+        ctx.fillRect(x+100,y-26,10,26);
+      }
+    }
+    grain(0.04);
+  }
+
+  function grain(alpha=0.05){
+    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    for(let i=0;i<160;i++){
+      const x = (Math.random()*canvas.width)|0;
+      const y = (Math.random()*canvas.height)|0;
+      ctx.fillRect(x,y,1,1);
+    }
+  }
+
+  function drawBackground(t){
+    const scene = LEVELS[levelIndex].scene;
+    if (scene==="hallway") drawHallway(t);
+    if (scene==="cafeteria") drawCafeteria(t);
+    if (scene==="gym") drawGym(t);
+    if (scene==="classroom") drawClassroom(t);
+    // ground shadow strip
+    ctx.fillStyle="rgba(0,0,0,0.45)";
+    ctx.fillRect(0,GROUND+20,960,70);
+  }
+
+  // ---------- HUD ----------
+  function bar(x,y,w,h,p,label,color){
+    ctx.strokeStyle="#fff";
+    ctx.lineWidth=2;
+    ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle=color;
+    ctx.fillRect(x,y,Math.max(0,w*p),h);
+    drawText(x, y-6, label, 14, "#fff");
+    ctx.lineWidth=1;
+  }
+
+  const announcer = {
+    text: "",
+    timer: 0
+  };
+
+  function say(text, ms=1600){
+    announcer.text = text;
+    announcer.timer = ms;
+  }
+
+  // ---------- Update ----------
+  let last = performance.now();
+
+  function update(dt){
+    if (hitstopTimer > 0){
+      hitstopTimer -= dt*1000;
+      return;
+    }
+    if (state !== STATE.PLAY) return;
+
+    const L = LEVELS[levelIndex];
+
+    // player input
+    deuce.vx = 0;
+    const movingLeft = keys.has("arrowleft");
+    const movingRight= keys.has("arrowright");
+
+    if (movingLeft)  { deuce.vx = -3.2; deuce.facing = -1; }
+    if (movingRight) { deuce.vx =  3.2; deuce.facing =  1; }
+
+    if ((keys.has(" ") || keys.has("space")) && deuce.onGround){
+      deuce.vy = -12.0;
+      deuce.onGround = false;
+      setAnim(deuce,"jump");
+      say(pick(["Agility training!","Up we go.","Parkour-ish."]), 900);
+    }
+
+    // attacks (training forms)
+    if (deuce.atkCd > 0) deuce.atkCd--;
+    if (deuce.atkWind > 0) deuce.atkWind--;
+
+    if (keys.has("a")) attack("a");
+    if (keys.has("s")) attack("s");
+    if (keys.has("d")) attack("d");
+
+    // physics
+    deuce.vy += GRAV;
+    deuce.x += deuce.vx;
+    deuce.y += deuce.vy;
+
+    if (deuce.y >= GROUND){
+      deuce.y = GROUND;
+      deuce.vy = 0;
+      deuce.onGround = true;
+      if (deuce.atkWind <= 0 && deuce.atkType) {
+        deuce.atkType = null;
+        setAnim(deuce,"recover");
+      } else if (deuce.atkWind <= 0) {
+        setAnim(deuce, Math.abs(deuce.vx)>0.2 ? "walk" : "idle");
+      }
+    } else {
+      setAnim(deuce,"jump");
+    }
+
+    // bounds
+    deuce.x = clamp(deuce.x, 30, canvas.width - 120);
+    enemy.x = clamp(enemy.x, 30, canvas.width - 120);
+
+    // enemy AI
+    if (enemy.stun > 0) enemy.stun -= dt*1000;
+    if (enemy.cd > 0) enemy.cd--;
+
+    const dx = (deuce.x - enemy.x);
+    const dist = Math.abs(dx);
+    enemy.facing = dx>0 ? 1 : -1;
+
+    // approach
+    const speed = L.speed * (enemy.kind==="boss" ? 0.9 : 1.0);
+    if (enemy.stun <= 0){
+      if (dist > (enemy.kind==="boss" ? 200 : 170)){
+        enemy.x += Math.sign(dx) * speed;
+      }
+    }
+
+    // enemy "tag" (non-violent) — drains hp as "stamina / system stress"
+    if (dist < (enemy.kind==="boss" ? 185 : 160) && enemy.cd <= 0 && enemy.stun <= 0){
+      enemy.cd = enemy.kind==="boss" ? 40 : 32;
+      const dmg = L.dmg + (enemy.kind==="boss" ? 2 : 0);
+      deuce.hp -= dmg;
+      say(pick(["System tags Deuce!","Training unit advances!","Uh-oh."]), 1100);
+      doHitstop(55);
+      shake = Math.max(shake, enemy.kind==="boss" ? 12 : 8);
+    }
+
+    // player hits enemy via hitbox
+    const hb = getAttackHitbox();
+    if (hb){
+      const er = { x: enemy.x+10, y: enemy.y-120, w: enemy.kind==="boss" ? 95 : 75, h: enemy.kind==="boss" ? 145 : 120 };
+      if (rectOverlap(hb, er)){
+        const dmg = deuce.atkType==="d" ? 16 : deuce.atkType==="s" ? 13 : 10;
+        enemy.hp -= enemy.kind==="boss" ? Math.ceil(dmg*0.85) : dmg;
+        enemy.stun = 220;
+        enemy.x += deuce.facing * (enemy.kind==="boss" ? 8 : 14);
+        doHitstop(HITSTOP_MS);
+        say(pick(["Clean form!","Nice technique.","Power fluctuation detected."]), 1200);
+        deuce.atkWind = 0; // single connect per move
+      }
+    }
+
+    // transitions
+    if (announcer.timer > 0) announcer.timer -= dt*1000;
+
+    if (enemy.hp <= 0){
+      if (levelIndex === LEVELS.length-1) state = STATE.WIN;
+      else { levelIndex++; startRound(); }
+    }
+    if (deuce.hp <= 0) state = STATE.LOSE;
+
+    deuce.animT += dt;
+    enemy.animT += dt;
+  }
+
+  // ---------- Render ----------
+  function render(now){
+    // shake
+    const sx = shake ? (rand(-shake, shake)|0) : 0;
+    const sy = shake ? (rand(-shake, shake)|0) : 0;
+    if (shake>0) shake = Math.max(0, shake-0.6);
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    const t = now/1000;
+
+    // draw bg always (looks nicer behind UI)
+    drawBackground(t);
+
+    // UI overlays
+    if (state === STATE.TITLE){
+      ctx.fillStyle="rgba(0,0,0,0.65)";
+      ctx.fillRect(0,0,960,540);
+      drawText(480,210,"SHORT CIRCUIT SHOWDOWN",56,"#36ff36","center");
+      drawText(480,270,"Press ENTER to Start",20,"#fff","center");
+      drawText(480,300,"Press I for Instructions",18,"#fff","center");
+      drawText(480,350,"A student detective. A school. AI training units posing as students.",16,"#cfd3d6","center");
+      drawText(480,375,"Win by making units power down. (Non-contact training showdown.)",16,"#cfd3d6","center");
+      ctx.restore();
+      return;
+    }
+
+    if (state === STATE.INSTR){
+      ctx.fillStyle="rgba(0,0,0,0.70)";
+      ctx.fillRect(90,70,780,400);
+      drawText(480,130,"INSTRUCTIONS",44,"#fff","center");
+      drawText(480,185,"←/→ Move   SPACE Jump",20,"#fff","center");
+      drawText(480,220,"A Chop Form   S Knee Form   D Kick Form",20,"#fff","center");
+      drawText(480,270,"Advance through: Hallway → Cafeteria → Gym → Classroom (final unit).",18,"#cfd3d6","center");
+      drawText(480,305,"Tip: Kicks reach farther, Chop is fastest, Knee is balanced.",18,"#cfd3d6","center");
+      drawText(480,360,"Press ENTER to return",18,"#36ff36","center");
+      ctx.restore();
+      return;
+    }
+
+    // HUD
+    bar(30,40,280,16, deuce.hp/deuce.maxHp, "DEUCE", "#36ff36");
+    bar(650,40,280,16, enemy.hp/enemy.maxHp, enemy.kind==="boss" ? "ADVANCED UNIT" : "TRAINING UNIT", "#ff4a4a");
+
+    // announcer strip
+    if (announcer.timer > 0 && announcer.text){
+      ctx.fillStyle="rgba(0,0,0,0.55)";
+      ctx.fillRect(30,70,900,28);
+      drawText(45,90,announcer.text,14,"#fff");
+    }
+
+    // Round banner
+    if (state === STATE.ROUND){
+      ctx.fillStyle="rgba(0,0,0,0.68)";
+      ctx.fillRect(0,170,960,150);
+      drawText(120,220,"ROUND START:",28,"#fff");
+      drawText(330,220,LEVELS[levelIndex].name,28,"#36ff36");
+      drawText(120,255,LEVELS[levelIndex].line,16,"#cfd3d6");
+      drawText(120,295,"Press ENTER to begin",18,"#fff");
+      ctx.restore();
+      return;
+    }
+
+    // fighters
+    drawDeuce(deuce.x, deuce.y, deuce.facing, deuce.anim, deuce.animT);
+    drawRobot(enemy.x, enemy.y, enemy.facing, enemy.kind, enemy.animT, enemy.stun>0);
+
+    // end screens
+    if (state === STATE.WIN){
+      ctx.fillStyle="rgba(0,0,0,0.75)";
+      ctx.fillRect(0,160,960,180);
+      drawText(480,235,"SYSTEMS POWERED DOWN!",54,"#36ff36","center");
+      drawText(480,280,"Deuce Dixon restores order… with extremely polite karate forms.",18,"#fff","center");
+      drawText(480,315,"Press ENTER to return to Title",18,"#36ff36","center");
+    }
+
+    if (state === STATE.LOSE){
+      ctx.fillStyle="rgba(0,0,0,0.75)";
+      ctx.fillRect(0,160,960,180);
+      drawText(480,235,"TRAINING FAILED",54,"#ff4a4a","center");
+      drawText(480,280,"Deuce needs a reboot. Or a snack. Or both.",18,"#fff","center");
+      drawText(480,315,"Press ENTER to return to Title",18,"#36ff36","center");
+    }
+
+    ctx.restore();
+  }
+
+  // ---------- Main Loop ----------
+  function loop(now){
+    const dt = Math.min(0.05, (now-last)/1000);
+    last = now;
+    update(dt);
+    render(now);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
